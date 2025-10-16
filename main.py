@@ -40,6 +40,17 @@ def enforce_sqlite(api_key: str):
         raise HTTPException(429, {"error":"rate_limited","limits":details})
     record_hit_sqlite(api_key)
 
+from utils.usage_bucket import init_bucket, take
+
+BUCKET_CAPACITY = float(os.environ.get("BUCKET_CAPACITY", "60"))      # tokens
+BUCKET_REFILL_RATE = float(os.environ.get("BUCKET_REFILL_RATE", "1")) # tokens/sec (~60/min)
+
+def enforce_bucket(api_key: str, cost: float = 1.0):
+    init_bucket(api_key, BUCKET_CAPACITY, BUCKET_REFILL_RATE)
+    ok, details = take(api_key, cost, BUCKET_CAPACITY, BUCKET_REFILL_RATE)
+    if not ok:
+        raise HTTPException(429, {"error":"rate_limited","bucket":details})
+
 APP_NAME = "PowerAI"
 APP_VERSION = "1.3.0"
 
