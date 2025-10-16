@@ -1,4 +1,4 @@
-# main.py (PowerAI)
+# main.py (PowerAI) — token-bucket rate limiting (SQLite persisted)
 import os, json, tempfile, uuid, stripe
 from typing import Optional
 
@@ -11,7 +11,10 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field
 
-from utils.usage import check_limit, record_hit
+# ==== Rate limiting (token bucket, persistent via SQLite) ====
+from utils.usage_bucket import init_bucket, take
+
+# ==== Core utilities ====
 from utils.scoring import DEFAULT_THRESHOLDS, fuse
 from utils.storage import save_upload
 from utils.jobs import set_job, get_job
@@ -22,50 +25,34 @@ from utils.auth import (
 )
 from utils.webhook import post_webhook
 
+# ==== Detectors / ML stubs ====
 from detectors.provenance import check_c2pa
 from detectors.watermark import scan_watermarks
 from detectors.visual import analyze_video
 from detectors.imagegen import analyze_image
 from detectors.audio import analyze_audio
-
 from ml.models import pseudo_image_score, pseudo_audio_score, pseudo_video_score, metrics_stub
-from utils.usage_sqlite import check_limit_sqlite, record_hit_sqlite
-
-RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "60"))
-RATE_LIMIT_PER_DAY = int(os.environ.get("RATE_LIMIT_PER_DAY", "5000"))
-
-def enforce_sqlite(api_key: str):
-    ok, details = check_limit_sqlite(api_key, RATE_LIMIT_PER_MIN, RATE_LIMIT_PER_DAY)
-    if not ok:
-        raise HTTPException(429, {"error":"rate_limited","limits":details})
-    record_hit_sqlite(api_key)
-
-from utils.usage_bucket import init_bucket, take
-
-BUCKET_CAPACITY = float(os.environ.get("BUCKET_CAPACITY", "60"))      # tokens
-BUCKET_REFILL_RATE = float(os.environ.get("BUCKET_REFILL_RATE", "1")) # tokens/sec (~60/min)
-
-def enforce_bucket(api_key: str, cost: float = 1.0):
-    init_bucket(api_key, BUCKET_CAPACITY, BUCKET_REFILL_RATE)
-    ok, details = take(api_key, cost, BUCKET_CAPACITY, BUCKET_REFILL_RATE)
-    if not ok:
-        raise HTTPException(429, {"error":"rate_limited","bucket":details})
 
 APP_NAME = "PowerAI"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.5.0"
 
+# ---- Secrets & toggles ----
 APP_SECRET = os.environ.get("IP_SESSION_SECRET", "dev_session_secret")
 REQUIRE_AUTH = os.environ.get("IP_REQUIRE_AUTH", "0") == "1"
-RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "60"))
-RATE_LIMIT_PER_DAY = int(os.environ.get("RATE_LIMIT_PER_DAY", "5000"))
 
-# Stripe config
+# Token bucket defaults (env configurable)
+# Capacity = burst size in tokens; refill_rate = tokens per second (e.g., 1 = ~60/min)
+BUCKET_CAPACITY = float(os.environ.get("BUCKET_CAPACITY", "60"))
+BUCKET_REFILL_RATE = float(os.environ.get("BUCKET_REFILL_RATE", "1"))
+
+# Stripe config (optional)
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
-STRIPE_PRICE_PRO_MONTH = os.environ.get("STRIPE_PRICE_PRO_MONTH")  # optional; can pass in request body
+STRIPE_PRICE_PRO_MONTH = os.environ.get("STRIPE_PRICE_PRO_MONTH")  # optional; can pass in body
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
+# ---- FastAPI app ----
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 app.add_middleware(SessionMiddleware, secret_key=APP_SECRET)
 
@@ -94,8 +81,10 @@ def api_key_user(
     x_api_key: Optional[str] = Header(None)
 ) -> Optional[dict]:
     token = None
+    # Authorization: Bearer sk_xxx
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization.split(" ", 1)[1].strip()
+    # Or X-API-Key: sk_xxx
     if not token and x_api_key:
         token = x_api_key.strip()
     if not token:
@@ -117,7 +106,6 @@ def require_auth_or_api_key(
         raise HTTPException(401, "Authentication required (session or API key).")
     return {"session_user": session_user, "header_user": header_user}
 
-# ---- Rate-limit helpers ----
 def active_api_key_for(user, header_user) -> str:
     """Prefer explicit header key; fallback to session user's key."""
     if header_user and header_user.get("api_key"):
@@ -126,21 +114,22 @@ def active_api_key_for(user, header_user) -> str:
         return user["api_key"]
     return "anon"
 
-def enforce_rate_limit(api_key: str):
-    ok, details = check_limit(api_key, RATE_LIMIT_PER_MIN, RATE_LIMIT_PER_DAY)
+def enforce_bucket(api_key: str, cost: float = 1.0):
+    """
+    Token-bucket limiter (SQLite persisted).
+    cost=1 token per request by default (tune per-endpoint if needed).
+    """
+    init_bucket(api_key, BUCKET_CAPACITY, BUCKET_REFILL_RATE)
+    ok, details = take(api_key, cost, BUCKET_CAPACITY, BUCKET_REFILL_RATE)
     if not ok:
-        raise HTTPException(
-            status_code=429,
-            detail={"error":"rate_limited","limits":details}
-        )
-    record_hit(api_key)
+        raise HTTPException(429, {"error": "rate_limited", "bucket": details})
 
 @app.post("/auth/register")
 def register(req: AuthReq, request: Request):
     try:
         user = create_user(req.email, req.password)
         request.session["email"] = user["email"]
-        return {"email": user["email"], "api_key": user["api_key"], "plan": user["plan"]}
+        return {"email": user["email"], "api_key": user["api_key"], "plan": user.get("plan", "free")}
     except ValueError:
         raise HTTPException(409, "User already exists")
 
@@ -150,7 +139,7 @@ def login(req: AuthReq, request: Request):
     if not user:
         raise HTTPException(401, "Invalid credentials")
     request.session["email"] = user["email"]
-    return {"email": user["email"], "api_key": user["api_key"], "plan": user["plan"]}
+    return {"email": user["email"], "api_key": user["api_key"], "plan": user.get("plan", "free")}
 
 @app.post("/auth/logout")
 def logout(request: Request):
@@ -210,7 +199,7 @@ async def _pipeline(job_id: str, modality: str, file_path: str, opts: AnalyzeOpt
         "audio_spoof": {},
         "identity": {"face_matches": [], "voice_matches": []},
         "artifacts": {"metadata_flags": [], "hashes": {}},
-        "model_versions": {"vision":"v0", "audio":"v0", "provenance":"v0"},
+        "model_versions": {"vision": "v0", "audio": "v0", "provenance": "v0"},
         "limitations": []
     }
     set_job(job_id, result)
@@ -235,7 +224,7 @@ async def _pipeline(job_id: str, modality: str, file_path: str, opts: AnalyzeOpt
         result["audio_spoof"] = analyze_audio(file_path)
         result["audio_spoof"]["nn_score"] = pseudo_audio_score(file_path)
 
-    # optional identity sidecar
+    # Optional identity sidecar vectors
     sidecar = file_path + ".vector.json"
     if os.path.exists(sidecar):
         try:
@@ -258,6 +247,7 @@ async def _pipeline(job_id: str, modality: str, file_path: str, opts: AnalyzeOpt
         try:
             await post_webhook(opts.callback_url, result)
         except Exception:
+            # don't fail the job if webhook delivery fails
             pass
 
 def _save_temp_upload(upload: UploadFile) -> str:
@@ -276,14 +266,14 @@ class EnrollRequest(BaseModel):
 @app.post("/v1/watchlist:enroll")
 def enroll(req: EnrollRequest, auth_ctx = Depends(require_auth_or_api_key)):
     api_key = active_api_key_for(auth_ctx.get("session_user"), auth_ctx.get("header_user"))
-    enforce_rate_limit(api_key)
+    enforce_bucket(api_key)
     id_enroll(profile_id=req.profile_id, typ=req.type, vector=req.vector)
     return {"profile_id": req.profile_id, "type": req.type}
 
 @app.delete("/v1/watchlist/{profile_id}", status_code=204)
 def delete_profile(profile_id: str, auth_ctx = Depends(require_auth_or_api_key)):
     api_key = active_api_key_for(auth_ctx.get("session_user"), auth_ctx.get("header_user"))
-    enforce_rate_limit(api_key)
+    enforce_bucket(api_key)
     id_delete(profile_id)
     return JSONResponse(status_code=204, content=None)
 
@@ -295,7 +285,7 @@ async def analyze_image_endpoint(
     auth_ctx = Depends(require_auth_or_api_key)
 ):
     api_key = active_api_key_for(auth_ctx.get("session_user"), auth_ctx.get("header_user"))
-    enforce_rate_limit(api_key)
+    enforce_bucket(api_key)
 
     try:
         opts = AnalyzeOptions.model_validate_json(options or "{}")
@@ -316,7 +306,7 @@ async def analyze_audio_endpoint(
     auth_ctx = Depends(require_auth_or_api_key)
 ):
     api_key = active_api_key_for(auth_ctx.get("session_user"), auth_ctx.get("header_user"))
-    enforce_rate_limit(api_key)
+    enforce_bucket(api_key)
 
     try:
         opts = AnalyzeOptions.model_validate_json(options or "{}")
@@ -337,7 +327,7 @@ async def analyze_video_endpoint(
     auth_ctx = Depends(require_auth_or_api_key)
 ):
     api_key = active_api_key_for(auth_ctx.get("session_user"), auth_ctx.get("header_user"))
-    enforce_rate_limit(api_key)
+    enforce_bucket(api_key)
 
     try:
         opts = AnalyzeOptions.model_validate_json(options or "{}")
@@ -353,7 +343,7 @@ async def analyze_video_endpoint(
 @app.get("/v1/jobs/{job_id}")
 def get_job_status(job_id: str, auth_ctx = Depends(require_auth_or_api_key)):
     api_key = active_api_key_for(auth_ctx.get("session_user"), auth_ctx.get("header_user"))
-    enforce_rate_limit(api_key)
+    enforce_bucket(api_key)
 
     job = get_job(job_id)
     if "error" in job:
