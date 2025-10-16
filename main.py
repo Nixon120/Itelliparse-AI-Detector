@@ -29,6 +29,16 @@ from detectors.imagegen import analyze_image
 from detectors.audio import analyze_audio
 
 from ml.models import pseudo_image_score, pseudo_audio_score, pseudo_video_score, metrics_stub
+from utils.usage_sqlite import check_limit_sqlite, record_hit_sqlite
+
+RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "60"))
+RATE_LIMIT_PER_DAY = int(os.environ.get("RATE_LIMIT_PER_DAY", "5000"))
+
+def enforce_sqlite(api_key: str):
+    ok, details = check_limit_sqlite(api_key, RATE_LIMIT_PER_MIN, RATE_LIMIT_PER_DAY)
+    if not ok:
+        raise HTTPException(429, {"error":"rate_limited","limits":details})
+    record_hit_sqlite(api_key)
 
 APP_NAME = "PowerAI"
 APP_VERSION = "1.3.0"
