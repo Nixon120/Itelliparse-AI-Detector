@@ -1,3 +1,4 @@
+# main.py (PowerAI)
 import os, json, tempfile, uuid, stripe
 from typing import Optional
 
@@ -10,20 +11,23 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field
 
+from utils.usage import check_limit, record_hit
+from utils.scoring import DEFAULT_THRESHOLDS, fuse
 from utils.storage import save_upload
 from utils.jobs import set_job, get_job
-from utils.scoring import fuse
 from utils.identity import enroll as id_enroll, delete as id_delete, match_face, match_voice
 from utils.auth import (
     create_user, verify_user, get_user,
     get_user_by_api_key, set_user_plan
 )
 from utils.webhook import post_webhook
+
 from detectors.provenance import check_c2pa
 from detectors.watermark import scan_watermarks
 from detectors.visual import analyze_video
 from detectors.imagegen import analyze_image
 from detectors.audio import analyze_audio
+
 from ml.models import pseudo_image_score, pseudo_audio_score, pseudo_video_score, metrics_stub
 
 APP_NAME = "PowerAI"
@@ -31,12 +35,13 @@ APP_VERSION = "1.3.0"
 
 APP_SECRET = os.environ.get("IP_SESSION_SECRET", "dev_session_secret")
 REQUIRE_AUTH = os.environ.get("IP_REQUIRE_AUTH", "0") == "1"
+RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "60"))
+RATE_LIMIT_PER_DAY = int(os.environ.get("RATE_LIMIT_PER_DAY", "5000"))
 
-# Stripe
+# Stripe config
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
-STRIPE_PRICE_PRO_MONTH = os.environ.get("STRIPE_PRICE_PRO_MONTH")  # optional, can pass from body
+STRIPE_PRICE_PRO_MONTH = os.environ.get("STRIPE_PRICE_PRO_MONTH")  # optional; can pass in request body
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
-
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
 
@@ -68,10 +73,8 @@ def api_key_user(
     x_api_key: Optional[str] = Header(None)
 ) -> Optional[dict]:
     token = None
-    # Authorization: Bearer sk_xxx
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization.split(" ", 1)[1].strip()
-    # Or X-API-Key: sk_xxx
     if not token and x_api_key:
         token = x_api_key.strip()
     if not token:
@@ -82,14 +85,34 @@ def require_auth_or_api_key(
     session_user = Depends(current_user),
     header_user = Depends(api_key_user)
 ):
+    """
+    Returns a dict with both users so we can determine the active API key.
+    Enforces auth if REQUIRE_AUTH=1.
+    """
     if not REQUIRE_AUTH:
-        # In dev mode, allow no auth
-        return session_user or header_user
-    # In prod mode, require either a valid session OR a valid API key user
+        return {"session_user": session_user, "header_user": header_user}
     user = session_user or header_user
     if not user:
         raise HTTPException(401, "Authentication required (session or API key).")
-    return user
+    return {"session_user": session_user, "header_user": header_user}
+
+# ---- Rate-limit helpers ----
+def active_api_key_for(user, header_user) -> str:
+    """Prefer explicit header key; fallback to session user's key."""
+    if header_user and header_user.get("api_key"):
+        return header_user["api_key"]
+    if user and user.get("api_key"):
+        return user["api_key"]
+    return "anon"
+
+def enforce_rate_limit(api_key: str):
+    ok, details = check_limit(api_key, RATE_LIMIT_PER_MIN, RATE_LIMIT_PER_DAY)
+    if not ok:
+        raise HTTPException(
+            status_code=429,
+            detail={"error":"rate_limited","limits":details}
+        )
+    record_hit(api_key)
 
 @app.post("/auth/register")
 def register(req: AuthReq, request: Request):
@@ -119,10 +142,30 @@ def me(user = Depends(current_user)):
         raise HTTPException(401, "Not authenticated")
     return {"email": user["email"], "api_key": user["api_key"], "plan": user.get("plan", "free")}
 
-# ---------- Metrics ----------
+# ---------- Public: metrics & models ----------
 @app.get("/v1/metrics")
 def metrics():
     return metrics_stub()
+
+@app.get("/v1/models")
+def list_models():
+    """
+    Exposes model versions and threshold configuration used in fusion.
+    Replace the version strings when you ship real models.
+    """
+    return {
+        "models": {
+            "vision": {"name": "vision_v0", "version": "0.1.0"},
+            "audio":  {"name": "audio_v0", "version": "0.1.0"},
+            "video":  {"name": "video_v0", "version": "0.1.0"},
+            "provenance": {"name": "c2pa_stub", "version": "0.1.0"},
+            "watermark":  {"name": "watermark_stub", "version": "0.1.0"},
+        },
+        "fusion": {
+            "strategy": "max",
+            "thresholds": DEFAULT_THRESHOLDS
+        }
+    }
 
 # ---------- Analyze pipeline ----------
 class AnalyzeOptions(BaseModel):
@@ -210,12 +253,16 @@ class EnrollRequest(BaseModel):
 
 # ---- Protected routes (session or API key) ----
 @app.post("/v1/watchlist:enroll")
-def enroll(req: EnrollRequest, user = Depends(require_auth_or_api_key)):
+def enroll(req: EnrollRequest, auth_ctx = Depends(require_auth_or_api_key)):
+    api_key = active_api_key_for(auth_ctx.get("session_user"), auth_ctx.get("header_user"))
+    enforce_rate_limit(api_key)
     id_enroll(profile_id=req.profile_id, typ=req.type, vector=req.vector)
     return {"profile_id": req.profile_id, "type": req.type}
 
 @app.delete("/v1/watchlist/{profile_id}", status_code=204)
-def delete_profile(profile_id: str, user = Depends(require_auth_or_api_key)):
+def delete_profile(profile_id: str, auth_ctx = Depends(require_auth_or_api_key)):
+    api_key = active_api_key_for(auth_ctx.get("session_user"), auth_ctx.get("header_user"))
+    enforce_rate_limit(api_key)
     id_delete(profile_id)
     return JSONResponse(status_code=204, content=None)
 
@@ -224,8 +271,11 @@ async def analyze_image_endpoint(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     options: str | None = None,
-    user = Depends(require_auth_or_api_key)
+    auth_ctx = Depends(require_auth_or_api_key)
 ):
+    api_key = active_api_key_for(auth_ctx.get("session_user"), auth_ctx.get("header_user"))
+    enforce_rate_limit(api_key)
+
     try:
         opts = AnalyzeOptions.model_validate_json(options or "{}")
     except Exception as e:
@@ -242,8 +292,11 @@ async def analyze_audio_endpoint(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     options: str | None = None,
-    user = Depends(require_auth_or_api_key)
+    auth_ctx = Depends(require_auth_or_api_key)
 ):
+    api_key = active_api_key_for(auth_ctx.get("session_user"), auth_ctx.get("header_user"))
+    enforce_rate_limit(api_key)
+
     try:
         opts = AnalyzeOptions.model_validate_json(options or "{}")
     except Exception as e:
@@ -260,8 +313,11 @@ async def analyze_video_endpoint(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     options: str | None = None,
-    user = Depends(require_auth_or_api_key)
+    auth_ctx = Depends(require_auth_or_api_key)
 ):
+    api_key = active_api_key_for(auth_ctx.get("session_user"), auth_ctx.get("header_user"))
+    enforce_rate_limit(api_key)
+
     try:
         opts = AnalyzeOptions.model_validate_json(options or "{}")
     except Exception as e:
@@ -274,7 +330,10 @@ async def analyze_video_endpoint(
     return {"job_id": job_id, "status": "queued"}
 
 @app.get("/v1/jobs/{job_id}")
-def get_job_status(job_id: str, user = Depends(require_auth_or_api_key)):
+def get_job_status(job_id: str, auth_ctx = Depends(require_auth_or_api_key)):
+    api_key = active_api_key_for(auth_ctx.get("session_user"), auth_ctx.get("header_user"))
+    enforce_rate_limit(api_key)
+
     job = get_job(job_id)
     if "error" in job:
         raise HTTPException(404, "Job not found")
@@ -282,7 +341,6 @@ def get_job_status(job_id: str, user = Depends(require_auth_or_api_key)):
 
 # ---------- Stripe: create checkout + webhook ----------
 class CheckoutReq(BaseModel):
-    # optional: pass a price if you don't set STRIPE_PRICE_PRO_MONTH
     price_id: Optional[str] = None
     success_url: Optional[str] = None
     cancel_url: Optional[str] = None
@@ -301,7 +359,7 @@ def create_checkout_session(
         raise HTTPException(400, "Missing Stripe price (set STRIPE_PRICE_PRO_MONTH or provide price_id).")
 
     success_url = req.success_url or (str(request.url_for("index")) + "?billing=success")
-    cancel_url = req.cancel_url or (str(request.url_for("pricing_page")) if "pricing_page" in app.router.routes else str(request.base_url) )
+    cancel_url = req.cancel_url or str(request.base_url)
 
     email = (user or {}).get("email") if user else req.customer_email
     session = stripe.checkout.Session.create(
@@ -325,7 +383,6 @@ async def stripe_webhook(request: Request):
     except Exception:
         raise HTTPException(400, "Invalid webhook signature")
 
-    # Handle a couple common events
     if event["type"] == "checkout.session.completed":
         cs = event["data"]["object"]
         email = cs.get("customer_email")
@@ -333,11 +390,6 @@ async def stripe_webhook(request: Request):
             set_user_plan(email, "pro")
 
     return {"ok": True}
-
-# A named route for success redirect (optional)
-@app.get("/pricing", name="pricing_page", response_class=HTMLResponse)
-def pricing_page():
-    return spa_index()
 
 # ---------- Webhooks tester ----------
 @app.post("/webhooks/test")
@@ -351,7 +403,7 @@ async def webhook_test(request: Request):
     return {"received": payload, "signature": sig, "length": len(body)}
 
 # ---------- SPA routes ----------
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", name="index", response_class=HTMLResponse)
 def index():
     return spa_index()
 
