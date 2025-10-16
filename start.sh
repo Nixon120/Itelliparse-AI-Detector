@@ -14,9 +14,9 @@ if [ ! -d "web/node_modules" ]; then
   echo "Installing frontend deps..."
   (cd web && npm install >/dev/null 2>&1)
 fi
-if [ ! -d "web/dist" ]; then
-  echo "Building frontend..."
-  (cd web && npm run build)
-fi
 
+echo "Building frontend..."
+(cd web && npm run build >/dev/null 2>&1 || npm run build)
+
+# Run API
 exec uvicorn main:app --host 0.0.0.0 --port 8000

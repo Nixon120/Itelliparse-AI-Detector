@@ -1,7 +1,7 @@
-import os, json, tempfile, uuid, asyncio
+import os, json, tempfile, uuid
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Request, Response, Depends
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
@@ -21,11 +21,12 @@ from detectors.audio import analyze_audio
 from ml.models import pseudo_image_score, pseudo_audio_score, pseudo_video_score, metrics_stub
 
 APP_SECRET = os.environ.get("IP_SESSION_SECRET", "dev_session_secret")
+REQUIRE_AUTH = os.environ.get("IP_REQUIRE_AUTH", "0") == "1"
 
-app = FastAPI(title="intelliparse API", version="1.1.0")
+app = FastAPI(title="PowerAI", version="1.2.0")
 app.add_middleware(SessionMiddleware, secret_key=APP_SECRET)
 
-# Serve SPA assets if built
+# Serve frontend
 if os.path.isdir("web/dist"):
     app.mount("/assets", StaticFiles(directory="web/dist/assets"), name="assets")
 
@@ -34,18 +35,9 @@ def spa_index() -> HTMLResponse:
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             return HTMLResponse(f.read())
-    return HTMLResponse("<h1>intelliparse</h1><p>Build the frontend to see the UI.</p>")
+    return HTMLResponse("<h1>PowerAI</h1><p>Build the frontend to see the UI.</p>")
 
-class AnalyzeOptions(BaseModel):
-    check_provenance: bool = True
-    check_watermarks: bool = True
-    check_audio: bool = True
-    check_visual: bool = True
-    face_watchlist: list[str] | None = None
-    voice_watchlist: list[str] | None = None
-    callback_url: str | None = None
-
-# -------- Auth Stub --------
+# -------- Auth --------
 class AuthReq(BaseModel):
     email: str
     password: str
@@ -54,6 +46,11 @@ def current_user(request: Request) -> Optional[dict]:
     email = request.session.get("email")
     if not email: return None
     return get_user(email)
+
+def require_auth(user = Depends(current_user)):
+    if REQUIRE_AUTH and not user:
+        raise HTTPException(401, "Authentication required")
+    return user
 
 @app.post("/auth/register")
 def register(req: AuthReq, request: Request):
@@ -83,13 +80,22 @@ def me(user = Depends(current_user)):
         raise HTTPException(401, "Not authenticated")
     return {"email": user["email"], "api_key": user["api_key"]}
 
-# -------- ML Metrics --------
+# -------- Models/Metrics --------
 @app.get("/v1/metrics")
 def metrics():
     return metrics_stub()
 
 # -------- Pipeline --------
-async def _pipeline(job_id: str, modality: str, file_path: str, opts: AnalyzeOptions, callback_url: Optional[str] = None):
+class AnalyzeOptions(BaseModel):
+    check_provenance: bool = True
+    check_watermarks: bool = True
+    check_audio: bool = True
+    check_visual: bool = True
+    face_watchlist: list[str] | None = None
+    voice_watchlist: list[str] | None = None
+    callback_url: str | None = None
+
+async def _pipeline(job_id: str, modality: str, file_path: str, opts: AnalyzeOptions):
     result = {
         "job_id": job_id,
         "status": "running",
@@ -111,8 +117,6 @@ async def _pipeline(job_id: str, modality: str, file_path: str, opts: AnalyzeOpt
             result["limitations"].append("no_c2pa_credentials_found")
     if opts.check_watermarks:
         result["watermarks"] = scan_watermarks(file_path, modality)
-
-    # ML/DL/NN pseudo-scores (deterministic) + existing stubs
     if modality == "image" and opts.check_visual:
         result["image_gen"] = analyze_image(file_path)
         result["image_gen"]["nn_score"] = pseudo_image_score(file_path)
@@ -126,7 +130,7 @@ async def _pipeline(job_id: str, modality: str, file_path: str, opts: AnalyzeOpt
         result["audio_spoof"] = analyze_audio(file_path)
         result["audio_spoof"]["nn_score"] = pseudo_audio_score(file_path)
 
-    # Sidecar embeddings matching
+    # Sidecar identity vectors
     sidecar = file_path + ".vector.json"
     if os.path.exists(sidecar):
         try:
@@ -145,12 +149,11 @@ async def _pipeline(job_id: str, modality: str, file_path: str, opts: AnalyzeOpt
     result["status"] = "completed"
     set_job(job_id, result)
 
-    # Webhook callback
-    if callback_url:
+    # Webhook callback if provided
+    if opts.callback_url:
         try:
-            await post_webhook(callback_url, result)
+            await post_webhook(opts.callback_url, result)
         except Exception:
-            # don't crash job if webhook fails
             pass
 
 def _save_temp_upload(upload: UploadFile) -> str:
@@ -165,20 +168,22 @@ class EnrollRequest(BaseModel):
     profile_id: str
     vector: list[float]
 
+# ---- Protected routes (behind auth if IP_REQUIRE_AUTH=1) ----
 @app.post("/v1/watchlist:enroll")
-def enroll(req: EnrollRequest):
+def enroll(req: EnrollRequest, user = Depends(require_auth)):
     id_enroll(profile_id=req.profile_id, typ=req.type, vector=req.vector)
     return {"profile_id": req.profile_id, "type": req.type}
 
 @app.delete("/v1/watchlist/{profile_id}", status_code=204)
-def delete_profile(profile_id: str):
+def delete_profile(profile_id: str, user = Depends(require_auth)):
     id_delete(profile_id)
     return JSONResponse(status_code=204, content=None)
 
 @app.post("/v1/images:analyze", status_code=202)
 async def analyze_image_endpoint(background_tasks: BackgroundTasks,
                                  file: UploadFile = File(...),
-                                 options: str | None = None):
+                                 options: str | None = None,
+                                 user = Depends(require_auth)):
     try:
         opts = AnalyzeOptions.model_validate_json(options or "{}")
     except Exception as e:
@@ -187,13 +192,14 @@ async def analyze_image_endpoint(background_tasks: BackgroundTasks,
     key, stored_path = save_upload(tmp, file.filename or "image")
     job_id = f"job_{uuid.uuid4().hex[:8]}"
     set_job(job_id, {"status": "queued"})
-    background_tasks.add_task(_pipeline, job_id, "image", stored_path, opts, opts.callback_url)
+    background_tasks.add_task(_pipeline, job_id, "image", stored_path, opts)
     return {"job_id": job_id, "status": "queued"}
 
 @app.post("/v1/audio:analyze", status_code=202)
 async def analyze_audio_endpoint(background_tasks: BackgroundTasks,
                                  file: UploadFile = File(...),
-                                 options: str | None = None):
+                                 options: str | None = None,
+                                 user = Depends(require_auth)):
     try:
         opts = AnalyzeOptions.model_validate_json(options or "{}")
     except Exception as e:
@@ -202,13 +208,14 @@ async def analyze_audio_endpoint(background_tasks: BackgroundTasks,
     key, stored_path = save_upload(tmp, file.filename or "audio")
     job_id = f"job_{uuid.uuid4().hex[:8]}"
     set_job(job_id, {"status": "queued"})
-    background_tasks.add_task(_pipeline, job_id, "audio", stored_path, opts, opts.callback_url)
+    background_tasks.add_task(_pipeline, job_id, "audio", stored_path, opts)
     return {"job_id": job_id, "status": "queued"}
 
 @app.post("/v1/videos:analyze", status_code=202)
 async def analyze_video_endpoint(background_tasks: BackgroundTasks,
                                  file: UploadFile = File(...),
-                                 options: str | None = None):
+                                 options: str | None = None,
+                                 user = Depends(require_auth)):
     try:
         opts = AnalyzeOptions.model_validate_json(options or "{}")
     except Exception as e:
@@ -217,22 +224,35 @@ async def analyze_video_endpoint(background_tasks: BackgroundTasks,
     key, stored_path = save_upload(tmp, file.filename or "video")
     job_id = f"job_{uuid.uuid4().hex[:8]}"
     set_job(job_id, {"status": "queued"})
-    background_tasks.add_task(_pipeline, job_id, "video", stored_path, opts, opts.callback_url)
+    background_tasks.add_task(_pipeline, job_id, "video", stored_path, opts)
     return {"job_id": job_id, "status": "queued"}
 
 @app.get("/v1/jobs/{job_id}")
-def get_job_status(job_id: str):
+def get_job_status(job_id: str, user = Depends(require_auth)):
     job = get_job(job_id)
     if "error" in job:
         raise HTTPException(404, "Job not found")
     return job
 
+# ---- Webhooks: local verification helper ----
+@app.post("/webhooks/test")
+async def webhook_test(request: Request):
+    # Echo back signature and body for debugging receivers
+    sig = request.headers.get("X-Intelliparse-Signature", "")
+    body = await request.body()
+    try:
+        payload = json.loads(body.decode("utf-8") or "{}")
+    except Exception:
+        payload = {"raw": body.decode("utf-8", errors="ignore")}
+    return {"received": payload, "signature": sig, "length": len(body)}
+
+# SPA routes
 @app.get("/", response_class=HTMLResponse)
 def index():
     return spa_index()
 
 @app.get("/{full_path:path}", response_class=HTMLResponse)
 def spa_routes(full_path: str):
-    if full_path.startswith("v1/") or full_path.startswith("assets/"):
+    if full_path.startswith("v1/") or full_path.startswith("assets/") or full_path.startswith("webhooks/"):
         return JSONResponse({"error": "Not Found"}, status_code=404)
     return spa_index()
